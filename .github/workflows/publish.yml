@@ -42,7 +42,7 @@ jobs:
         id: check
         env:
           REPO: "https://downloads.claude.ai/claude-desktop/apt/stable"
-        working-directory: "$RUNNER_TEMP"
+        working-directory: ${{ runner.temp }}
         run: |
           curl -fsSL "$REPO/dists/stable/main/binary-amd64/Packages" -o Packages
 
@@ -55,9 +55,9 @@ jobs:
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Download, verify, and build RPM
-        working-directory: "$RUNNER_TEMP"
+        working-directory: ${{ runner.temp }}
         run: |
-          mkdir -p "$RUNNER_TEMP/rpmbuild/{BUILD,RPMS,SOURCES/unpacked,SPECS,SRPMS}"
+          mkdir -p "$RUNNER_TEMP/rpmbuild"/{BUILD,RPMS,SOURCES/unpacked,SPECS,SRPMS}
           curl -fL "${{ steps.check.outputs.url }}" -o claude-desktop.deb
           echo "${{ steps.check.outputs.sha256 }}  claude-desktop.deb" | sha256sum -c -
 
@@ -67,14 +67,33 @@ jobs:
           sed "s/@VERSION@/${{ steps.check.outputs.version }}/g" \
             "$GITHUB_WORKSPACE/claude-desktop.spec" > "$RUNNER_TEMP/rpmbuild/SPECS/claude-desktop.spec"
 
-          rpmbuild -bb "$RUNNER_TEMP/rpmbuild/SPECS/claude-desktop.spec"
+          rpmbuild --define "_topdir $RUNNER_TEMP/rpmbuild" \
+            -bb "$RUNNER_TEMP/rpmbuild/SPECS/claude-desktop.spec"
+
+      - name: Install and verify RPM
+        run: |
+          RPM_FILE=$(find "$RUNNER_TEMP/rpmbuild/RPMS/x86_64" -maxdepth 1 -type f -name '*.rpm' -print -quit)
+          test -n "$RPM_FILE"
+
+          dnf install -y --setopt=localpkg_gpgcheck=0 "$RPM_FILE"
+          rpm -q claude-desktop
+
+          test -x /usr/bin/claude-desktop
+          test -f /usr/share/applications/claude-desktop.desktop
+          test "$(stat -c '%a' /usr/lib/claude-desktop/chrome-sandbox)" = 4755
+
+          VERIFY_OUTPUT=$(rpm -V claude-desktop)
+          if [ -n "$VERIFY_OUTPUT" ]; then
+            printf '%s\n' "$VERIFY_OUTPUT" >&2
+            exit 1
+          fi
 
       - name: Sign RPM and generate DNF repository metadata
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/public"
-          cp "$RUNNER_TEMP/rpmbuild/RPMS/x86_64/*.rpm" "$GITHUB_WORKSPACE/public/"
+          cp "$RUNNER_TEMP/rpmbuild/RPMS/x86_64/"*.rpm "$GITHUB_WORKSPACE/public/"
           cp "$GITHUB_WORKSPACE/RPM-GPG-KEY-claude-desktop" "$GITHUB_WORKSPACE/public/"
           touch "$GITHUB_WORKSPACE/public/.nojekyll"
 

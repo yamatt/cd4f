@@ -17,11 +17,13 @@ Unofficial RPM repackage of Anthropic's official Debian package for Claude Deskt
 %install
 mkdir -p %{buildroot}
 cp -a %{_sourcedir}/unpacked/* %{buildroot}/
+chmod 4755 %{buildroot}/usr/lib/claude-desktop/chrome-sandbox
 
 %files
 %defattr(-,root,root,-)
 /usr/bin/claude-desktop
 /usr/lib/claude-desktop
-%attr(4755,root,root) /usr/lib/claude-desktop/chrome-sandbox
 /usr/share/applications/claude-desktop.desktop
 /usr/share/icons/hicolor/*/apps/claude-desktop.png
+/usr/share/doc/claude-desktop/copyright
+/usr/share/lintian/overrides/claude-desktop
