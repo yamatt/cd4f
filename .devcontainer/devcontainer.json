@@ -1,0 +1,7 @@
+{
+  "name": "Claude Desktop for Fedora",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "root"
+}

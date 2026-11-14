@@ -1,0 +1,95 @@
+name: Build and Publish DNF Repo
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "claude-desktop.spec"
+      - "RPM-GPG-KEY-claude-desktop"
+      - ".github/workflows/publish.yml"
+  schedule:
+    - cron: "0 6 * * 1" # Every Monday at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Install RPM build, signing, and repo tools
+        run: |
+          dnf install -y rpm-build rpm-sign createrepo_c binutils tar xz curl gnupg2
+      - name: Make extract directory for RPM build
+        run: |
+          mkdir -p "$RUNNER_TEMP/rpmbuild/SOURCES/unpacked"
+
+      - name: Resolve latest version from Anthropic APT repo
+        id: check
+        env:
+          REPO: "https://downloads.claude.ai/claude-desktop/apt/stable"
+        working-directory: "$RUNNER_TEMP"
+        run: |
+          curl -fsSL "$REPO/dists/stable/main/binary-amd64/Packages" -o Packages
+
+          VER=$(awk '/^Package: claude-desktop$/{f=1} f && /^Version:/{print $2; exit}' Packages)
+          FILE=$(awk '/^Package: claude-desktop$/{f=1} f && /^Filename:/{print $2; exit}' Packages)
+          SHA=$(awk '/^Package: claude-desktop$/{f=1} f && /^SHA256:/{print $2; exit}' Packages)
+
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "url=$REPO/$FILE" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Download, verify, and build RPM
+        working-directory: "$RUNNER_TEMP"
+        run: |
+          mkdir -p "$RUNNER_TEMP/rpmbuild/{BUILD,RPMS,SOURCES/unpacked,SPECS,SRPMS}"
+          curl -fL "${{ steps.check.outputs.url }}" -o claude-desktop.deb
+          echo "${{ steps.check.outputs.sha256 }}  claude-desktop.deb" | sha256sum -c -
+
+          ar x claude-desktop.deb
+          tar -xJf data.tar.xz -C "$RUNNER_TEMP/rpmbuild/SOURCES/unpacked"
+
+          sed "s/@VERSION@/${{ steps.check.outputs.version }}/g" \
+            "$GITHUB_WORKSPACE/claude-desktop.spec" > "$RUNNER_TEMP/rpmbuild/SPECS/claude-desktop.spec"
+
+          rpmbuild -bb "$RUNNER_TEMP/rpmbuild/SPECS/claude-desktop.spec"
+
+      - name: Sign RPM and generate DNF repository metadata
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/public"
+          cp "$RUNNER_TEMP/rpmbuild/RPMS/x86_64/*.rpm" "$GITHUB_WORKSPACE/public/"
+          cp "$GITHUB_WORKSPACE/RPM-GPG-KEY-claude-desktop" "$GITHUB_WORKSPACE/public/"
+          touch "$GITHUB_WORKSPACE/public/.nojekyll"
+
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          KEY_NAME=$(gpg --list-secret-keys --with-colons | awk -F: '/^uid:/ {print $10; exit}')
+          echo "%_gpg_name $KEY_NAME" > ~/.rpmmacros
+
+          rpmsign --addsign "$GITHUB_WORKSPACE/public/"*.rpm
+          createrepo_c "$GITHUB_WORKSPACE/public"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: public
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5.0.1
