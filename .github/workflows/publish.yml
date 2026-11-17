@@ -7,6 +7,7 @@ on:
     paths:
       - "claude-desktop.spec"
       - "RPM-GPG-KEY-claude-desktop"
+      - "ANTHROPIC-APT-KEY.asc"
       - ".github/workflows/publish.yml"
   schedule:
     - cron: "0 6 * * 1" # Every Monday at 06:00 UTC
@@ -25,59 +26,107 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     container:
-      image: fedora:45
-
+      image: fedora:45@sha256:a7d72ba2745b100a3351087472e5ee7b2450af7cf331e7673007e3817612839c
+    env:
+      REPO: "https://downloads.claude.ai/claude-desktop/apt/stable"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
-      - name: Install RPM build, signing, and repo tools
+      - name: Install build dependencies
         run: |
           dnf install -y rpm-build rpm-sign createrepo_c binutils tar xz curl gnupg2
-      - name: Make extract directory for RPM build
+      - name: Verify Anthropic repository signature
         run: |
-          mkdir -p "$RUNNER_TEMP/rpmbuild/SOURCES/unpacked"
+          gpg --batch --import "ANTHROPIC-APT-KEY.asc"
 
-      - name: Resolve latest version from Anthropic APT repo
-        id: check
-        env:
-          REPO: "https://downloads.claude.ai/claude-desktop/apt/stable"
+          curl -fsSL "$REPO/dists/stable/InRelease" -o "$RUNNER_TEMP/InRelease"
+          gpg --batch --output "$RUNNER_TEMP/Release" --decrypt "$RUNNER_TEMP/InRelease"
+
+      - name: Download APT package index
         working-directory: ${{ runner.temp }}
         run: |
           curl -fsSL "$REPO/dists/stable/main/binary-amd64/Packages" -o Packages
 
+      - name: Verify APT package index
+        working-directory: ${{ runner.temp }}
+        run: |
+          RELEASE_ENTRY=$(awk '
+            $1 == "SHA256:" { in_sha256=1; next }
+            /^[A-Za-z0-9][A-Za-z0-9-]*:/ { in_sha256=0 }
+            in_sha256 && $3 == "main/binary-amd64/Packages" {print $1, $2}
+          ' Release)
+          if [ -z "$RELEASE_ENTRY" ]; then
+            echo "Could not find Packages in the signed repository metadata" >&2
+            exit 1
+          fi
+          read -r RELEASE_SHA RELEASE_SIZE <<< "$RELEASE_ENTRY"
+          if [[ ! "$RELEASE_SHA" =~ ^[[:xdigit:]]{64}$ || ! "$RELEASE_SIZE" =~ ^[0-9]+$ ]]; then
+            echo "Could not find a valid SHA-256 and size for Packages in signed metadata" >&2
+            exit 1
+          fi
+          test "$(wc -c < Packages)" -eq "$RELEASE_SIZE"
+          echo "$RELEASE_SHA  Packages" | sha256sum -c -
+
+      - name: Resolve latest Claude Desktop package
+        id: package
+        working-directory: ${{ runner.temp }}
+        run: |
           VER=$(awk '/^Package: claude-desktop$/{f=1} f && /^Version:/{print $2; exit}' Packages)
           FILE=$(awk '/^Package: claude-desktop$/{f=1} f && /^Filename:/{print $2; exit}' Packages)
           SHA=$(awk '/^Package: claude-desktop$/{f=1} f && /^SHA256:/{print $2; exit}' Packages)
+
+          if [[ ! "$VER" =~ ^[A-Za-z0-9.+:~_-]+$ ||
+                ! "$FILE" =~ ^pool/main/c/claude-desktop/claude-desktop_[A-Za-z0-9.+:~_-]+\.deb$ ||
+                ! "$SHA" =~ ^[[:xdigit:]]{64}$ ]]; then
+            echo "Could not find valid claude-desktop package metadata" >&2
+            exit 1
+          fi
 
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "url=$REPO/$FILE" >> "$GITHUB_OUTPUT"
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Download, verify, and build RPM
+      - name: Download Debian package
+        env:
+          PACKAGE_URL: ${{ steps.package.outputs.url }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -fL "$PACKAGE_URL" -o claude-desktop.deb
+
+      - name: Verify Debian package
+        env:
+          PACKAGE_SHA256: ${{ steps.package.outputs.sha256 }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          echo "$PACKAGE_SHA256  claude-desktop.deb" | sha256sum -c -
+
+      - name: Build RPM
+        env:
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
         working-directory: ${{ runner.temp }}
         run: |
           mkdir -p "$RUNNER_TEMP/rpmbuild"/{BUILD,RPMS,SOURCES/unpacked,SPECS,SRPMS}
-          curl -fL "${{ steps.check.outputs.url }}" -o claude-desktop.deb
-          echo "${{ steps.check.outputs.sha256 }}  claude-desktop.deb" | sha256sum -c -
-
           ar x claude-desktop.deb
           tar -xJf data.tar.xz -C "$RUNNER_TEMP/rpmbuild/SOURCES/unpacked"
 
-          sed "s/@VERSION@/${{ steps.check.outputs.version }}/g" \
+          sed "s/@VERSION@/$PACKAGE_VERSION/g" \
             "$GITHUB_WORKSPACE/claude-desktop.spec" > "$RUNNER_TEMP/rpmbuild/SPECS/claude-desktop.spec"
 
           rpmbuild --define "_topdir $RUNNER_TEMP/rpmbuild" \
             -bb "$RUNNER_TEMP/rpmbuild/SPECS/claude-desktop.spec"
 
-      - name: Install and verify RPM
+      - name: Install RPM
         run: |
           RPM_FILE=$(find "$RUNNER_TEMP/rpmbuild/RPMS/x86_64" -maxdepth 1 -type f -name '*.rpm' -print -quit)
           test -n "$RPM_FILE"
 
           dnf install -y --setopt=localpkg_gpgcheck=0 "$RPM_FILE"
+
+      - name: Verify installed RPM
+        run: |
           rpm -q claude-desktop
 
           test -x /usr/bin/claude-desktop
@@ -90,20 +139,25 @@ jobs:
             exit 1
           fi
 
-      - name: Sign RPM and generate DNF repository metadata
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      - name: Prepare Pages artifact
         run: |
           mkdir -p "$GITHUB_WORKSPACE/public"
           cp "$RUNNER_TEMP/rpmbuild/RPMS/x86_64/"*.rpm "$GITHUB_WORKSPACE/public/"
           cp "$GITHUB_WORKSPACE/RPM-GPG-KEY-claude-desktop" "$GITHUB_WORKSPACE/public/"
           touch "$GITHUB_WORKSPACE/public/.nojekyll"
 
+      - name: Sign RPM
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
           printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
           KEY_NAME=$(gpg --list-secret-keys --with-colons | awk -F: '/^uid:/ {print $10; exit}')
           echo "%_gpg_name $KEY_NAME" > ~/.rpmmacros
 
           rpmsign --addsign "$GITHUB_WORKSPACE/public/"*.rpm
+
+      - name: Generate DNF repository metadata
+        run: |
           createrepo_c "$GITHUB_WORKSPACE/public"
 
       - name: Upload Pages artifact
